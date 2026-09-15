@@ -1,6 +1,42 @@
 @AdminPortal.Api_HostAddress = http://localhost:5245
 
-GET {{AdminPortal.Api_HostAddress}}/weatherforecast/
+### Health check
+GET {{AdminPortal.Api_HostAddress}}/health
 Accept: application/json
+
+### List departments
+GET {{AdminPortal.Api_HostAddress}}/api/departments
+Accept: application/json
+
+### Create a department
+POST {{AdminPortal.Api_HostAddress}}/api/departments
+Content-Type: application/json
+
+{
+  "name": "Engineering",
+  "description": "Builds and maintains the product"
+}
+
+### List employees (paged, filterable)
+GET {{AdminPortal.Api_HostAddress}}/api/employees?page=1&pageSize=20
+Accept: application/json
+
+### Search employees by name/email
+GET {{AdminPortal.Api_HostAddress}}/api/employees?search=jane
+Accept: application/json
+
+### Create an employee
+POST {{AdminPortal.Api_HostAddress}}/api/employees
+Content-Type: application/json
+
+{
+  "firstName": "Jane",
+  "lastName": "Doe",
+  "email": "jane.doe@example.com",
+  "phoneNumber": "+27821234567",
+  "hireDate": "2026-01-15T00:00:00Z",
+  "salary": 45000,
+  "departmentId": 1
+}
 
 ###

@@ -1,10 +1,10 @@
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
+using Npgsql;
 using AdminPortalApi.Data;
-using static Microsoft.EntityFrameworkCore.DbLoggerCategory;
-using static System.Net.Mime.MediaTypeNames;
 using AdminPortalApi.Models;
 using AdminPortal.Models.Entities;
-using AdminPortal.Api.Models;
 
 namespace AdminPortalApi.Controllers
 {
@@ -12,37 +12,101 @@ namespace AdminPortalApi.Controllers
     [Route("api/[controller]")]
     public class EmployeesController : ControllerBase
     {
-        private readonly ApplicationDbContext dbContext;
+        private static readonly TimeSpan CacheDuration = TimeSpan.FromMinutes(2);
 
-        public EmployeesController(ApplicationDbContext dbContext)
+        private readonly ApplicationDbContext dbContext;
+        private readonly IMemoryCache cache;
+        private readonly ILogger<EmployeesController> logger;
+
+        public EmployeesController(ApplicationDbContext dbContext, IMemoryCache cache, ILogger<EmployeesController> logger)
         {
             this.dbContext = dbContext;
+            this.cache = cache;
+            this.logger = logger;
         }
 
-        // GET: api/Employees
+        // GET: api/Employees?search=&departmentId=&page=1&pageSize=20
         [HttpGet]
-        public IActionResult GetAllEmployees()
+        public async Task<IActionResult> GetAllEmployees(
+            [FromQuery] string? search,
+            [FromQuery] int? departmentId,
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 20)
         {
-            var allEmployees = dbContext.Employees.ToList();
-            return Ok(allEmployees);
+            page = page < 1 ? 1 : page;
+            pageSize = pageSize is < 1 or > 100 ? 20 : pageSize;
+
+            var query = dbContext.Employees.AsNoTracking().AsQueryable();
+
+            if (departmentId is not null)
+            {
+                query = query.Where(e => e.DepartmentId == departmentId);
+            }
+
+            if (!string.IsNullOrWhiteSpace(search))
+            {
+                var term = $"%{search.Trim()}%";
+                query = query.Where(e =>
+                    EF.Functions.ILike(e.FirstName, term) ||
+                    EF.Functions.ILike(e.LastName, term) ||
+                    EF.Functions.ILike(e.Email, term));
+            }
+
+            var totalCount = await query.CountAsync();
+            var employees = await query
+                .OrderBy(e => e.LastName)
+                .ThenBy(e => e.FirstName)
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
+                .ToListAsync();
+
+            logger.LogInformation("Retrieved {Count} of {TotalCount} employees (page {Page})", employees.Count, totalCount, page);
+
+            return Ok(new PagedResult<Employee>
+            {
+                Items = employees,
+                Page = page,
+                PageSize = pageSize,
+                TotalCount = totalCount
+            });
         }
 
+        // GET: api/Employees/{id}
         [HttpGet("{id:guid}")]
-        public IActionResult GetEmployeeById(Guid id)
+        public async Task<IActionResult> GetEmployeeById(Guid id)
         {
-            var employee = dbContext.Employees.FirstOrDefault(e => e.Id == id);
-            if (employee == null)
+            var cacheKey = $"employee:{id}";
+
+            if (!cache.TryGetValue(cacheKey, out Employee? employee))
             {
-                return NotFound();
+                employee = await dbContext.Employees.AsNoTracking().FirstOrDefaultAsync(e => e.Id == id);
+                if (employee is not null)
+                {
+                    cache.Set(cacheKey, employee, CacheDuration);
+                }
             }
+
+            if (employee is null)
+            {
+                logger.LogWarning("Employee {EmployeeId} not found", id);
+                return NotFound(ProblemFor(StatusCodes.Status404NotFound, "Employee not found", $"No employee exists with id '{id}'."));
+            }
+
             return Ok(employee);
         }
 
+        // POST: api/Employees
         [HttpPost]
-        public IActionResult CreateEmployee(CreateEmployeeDto createEmployeeDto)
+        public async Task<IActionResult> CreateEmployee(CreateEmployeeDto createEmployeeDto)
         {
+            var departmentExists = await dbContext.Departments.AnyAsync(d => d.Id == createEmployeeDto.DepartmentId);
+            if (!departmentExists)
+            {
+                return BadRequest(ProblemFor(StatusCodes.Status400BadRequest, "Invalid department",
+                    $"Department with id '{createEmployeeDto.DepartmentId}' does not exist."));
+            }
 
-            var employeeEntity = new Employee()
+            var employee = new Employee
             {
                 FirstName = createEmployeeDto.FirstName,
                 LastName = createEmployeeDto.LastName,
@@ -53,19 +117,38 @@ namespace AdminPortalApi.Controllers
                 DepartmentId = createEmployeeDto.DepartmentId
             };
 
-            dbContext.Employees.Add(employeeEntity);
-            dbContext.SaveChanges();
-            return Ok(employeeEntity);
+            try
+            {
+                dbContext.Employees.Add(employee);
+                await dbContext.SaveChangesAsync();
+            }
+            catch (DbUpdateException ex) when (IsUniqueViolation(ex))
+            {
+                logger.LogWarning(ex, "Attempted to create employee with duplicate email {Email}", createEmployeeDto.Email);
+                return Conflict(ProblemFor(StatusCodes.Status409Conflict, "Duplicate email",
+                    $"An employee with email '{createEmployeeDto.Email}' already exists."));
+            }
+
+            logger.LogInformation("Created employee {EmployeeId}", employee.Id);
+            return CreatedAtAction(nameof(GetEmployeeById), new { id = employee.Id }, employee);
         }
 
+        // PUT: api/Employees/{id}
         [HttpPut("{id:guid}")]
-        public IActionResult UpdateEmployee(Guid id, UpdateEmployeeDto updateEmployeeDto)
+        public async Task<IActionResult> UpdateEmployee(Guid id, UpdateEmployeeDto updateEmployeeDto)
         {
-            var employee = dbContext.Employees.Find(id);
-
-            if (employee == null)
+            var employee = await dbContext.Employees.FindAsync(id);
+            if (employee is null)
             {
-                return NotFound();
+                logger.LogWarning("Attempted to update employee {EmployeeId} but it was not found", id);
+                return NotFound(ProblemFor(StatusCodes.Status404NotFound, "Employee not found", $"No employee exists with id '{id}'."));
+            }
+
+            var departmentExists = await dbContext.Departments.AnyAsync(d => d.Id == updateEmployeeDto.DepartmentId);
+            if (!departmentExists)
+            {
+                return BadRequest(ProblemFor(StatusCodes.Status400BadRequest, "Invalid department",
+                    $"Department with id '{updateEmployeeDto.DepartmentId}' does not exist."));
             }
 
             employee.FirstName = updateEmployeeDto.FirstName;
@@ -73,25 +156,51 @@ namespace AdminPortalApi.Controllers
             employee.Email = updateEmployeeDto.Email;
             employee.PhoneNumber = updateEmployeeDto.PhoneNumber;
             employee.Salary = updateEmployeeDto.Salary;
+            employee.DepartmentId = updateEmployeeDto.DepartmentId;
 
-            dbContext.SaveChanges();
+            try
+            {
+                await dbContext.SaveChangesAsync();
+            }
+            catch (DbUpdateException ex) when (IsUniqueViolation(ex))
+            {
+                logger.LogWarning(ex, "Attempted to update employee {EmployeeId} with duplicate email {Email}", id, updateEmployeeDto.Email);
+                return Conflict(ProblemFor(StatusCodes.Status409Conflict, "Duplicate email",
+                    $"An employee with email '{updateEmployeeDto.Email}' already exists."));
+            }
+
+            cache.Remove($"employee:{id}");
+            logger.LogInformation("Updated employee {EmployeeId}", id);
             return Ok(employee);
         }
 
+        // DELETE: api/Employees/{id}
         [HttpDelete("{id:guid}")]
-        public IActionResult DeleteEmployee(Guid id)
+        public async Task<IActionResult> DeleteEmployee(Guid id)
         {
-            var employee = dbContext.Employees.Find(id);
-
-            if (employee == null)
+            var employee = await dbContext.Employees.FindAsync(id);
+            if (employee is null)
             {
-                return NotFound();
+                logger.LogWarning("Attempted to delete employee {EmployeeId} but it was not found", id);
+                return NotFound(ProblemFor(StatusCodes.Status404NotFound, "Employee not found", $"No employee exists with id '{id}'."));
             }
 
             dbContext.Employees.Remove(employee);
-            dbContext.SaveChanges();
-            return Ok();
-        }
-    }
+            await dbContext.SaveChangesAsync();
 
+            cache.Remove($"employee:{id}");
+            logger.LogInformation("Deleted employee {EmployeeId}", id);
+            return NoContent();
+        }
+
+        private static bool IsUniqueViolation(DbUpdateException ex) =>
+            ex.InnerException is PostgresException { SqlState: PostgresErrorCodes.UniqueViolation };
+
+        private static ProblemDetails ProblemFor(int status, string title, string detail) => new()
+        {
+            Status = status,
+            Title = title,
+            Detail = detail
+        };
+    }
 }
