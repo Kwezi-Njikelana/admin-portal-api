@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using AdminPortal.Models.Entities;
 
 namespace AdminPortalApi.Data
 {
@@ -8,6 +9,26 @@ namespace AdminPortalApi.Data
         {
         }
 
-        public DbSet<AdminPortal.Models.Entities.Employee> Employees { get; set; }
+        public DbSet<Employee> Employees { get; set; }
+        public DbSet<Department> Departments { get; set; }
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            base.OnModelCreating(modelBuilder);
+
+            modelBuilder.Entity<Employee>()
+                .HasIndex(e => e.Email)
+                .IsUnique();
+
+            modelBuilder.Entity<Employee>()
+                .HasOne(e => e.Department)
+                .WithMany(d => d.Employees)
+                .HasForeignKey(e => e.DepartmentId)
+                .OnDelete(DeleteBehavior.Restrict);
+
+            modelBuilder.Entity<Department>()
+                .HasIndex(d => d.Name)
+                .IsUnique();
+        }
     }
 }
